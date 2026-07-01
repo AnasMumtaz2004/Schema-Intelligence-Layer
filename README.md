@@ -1,4 +1,4 @@
-# Dataset Identification Agent
+# Schema Intelligence Layer
 
 A FastAPI-based agent that ingests CSV and Excel datasets, extracts metadata, classifies the business domain using a Groq-hosted LLM, and stores metadata in a centralized SQLite database.
 
