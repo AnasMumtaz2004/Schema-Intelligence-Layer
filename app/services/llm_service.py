@@ -10,6 +10,10 @@ from groq import Groq
 
 from app.config import settings
 from app.models.schemas import DatasetMetadata, LLMClassification
+from app.prompts.llm_service_prompt import (
+    get_column_descriptions_prompt,
+    get_classify_dataset_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +29,93 @@ VALID_DOMAINS = [
     "Healthcare",
     "Other",
 ]
+
+# Sub-domain taxonomy — LLM must pick from these for the chosen domain
+SUB_DOMAINS: dict[str, list[str]] = {
+    "Finance": [
+        "Payments",
+        "Credit Cards",
+        "Banking & Accounts",
+        "Loans & Mortgages",
+        "Investments & Trading",
+        "Insurance",
+        "Accounting & Ledger",
+        "Fraud Detection",
+        "Risk Management",
+        "Other Finance",
+    ],
+    "Sales": [
+        "E-commerce",
+        "Retail",
+        "B2B Sales",
+        "CRM & Pipeline",
+        "Revenue Analytics",
+        "Pricing",
+        "Other Sales",
+    ],
+    "Marketing": [
+        "Digital Marketing",
+        "Campaign Analytics",
+        "SEO/SEM",
+        "Social Media",
+        "Email Marketing",
+        "Customer Acquisition",
+        "Other Marketing",
+    ],
+    "Human Resources": [
+        "Payroll",
+        "Recruitment",
+        "Employee Performance",
+        "Training & Development",
+        "Benefits",
+        "Workforce Planning",
+        "Other HR",
+    ],
+    "Operations": [
+        "Manufacturing",
+        "Quality Control",
+        "Project Management",
+        "IT Operations",
+        "Facilities",
+        "Other Operations",
+    ],
+    "Supply Chain": [
+        "Inventory",
+        "Procurement",
+        "Logistics & Shipping",
+        "Warehouse",
+        "Demand Forecasting",
+        "Vendor Management",
+        "Other Supply Chain",
+    ],
+    "Customer Support": [
+        "Ticketing & Issues",
+        "Customer Feedback",
+        "SLA Management",
+        "Chat & Interaction Logs",
+        "Other Customer Support",
+    ],
+    "Healthcare": [
+        "Patient Records",
+        "Clinical Trials",
+        "Medical Billing & Claims",
+        "Pharmacy",
+        "Lab Results",
+        "Other Healthcare",
+    ],
+    "Other": [
+        "General",
+        "Unknown",
+    ],
+}
+
+
+def _build_sub_domains_str() -> str:
+    """Format SUB_DOMAINS taxonomy as a readable string for the LLM prompt."""
+    lines = []
+    for domain, subs in SUB_DOMAINS.items():
+        lines.append(f"  {domain}: {', '.join(subs)}")
+    return "\n".join(lines)
 
 
 def _get_groq_client() -> Groq:
@@ -45,15 +136,22 @@ def _build_metadata_context(metadata: DatasetMetadata) -> str:
         "Columns:",
     ]
 
+    # Pre-extract up to 3 distinct non-empty sample values per column from sample_data list
+    col_samples = {col: [] for col in metadata.column_names}
+    if metadata.sample_data:
+        for row in metadata.sample_data:
+            for col in metadata.column_names:
+                val = row.get(col)
+                if val is not None and val != "":
+                    val_str = str(val)[:50]  # Limit length of a single sample value
+                    if val_str not in col_samples[col] and len(col_samples[col]) < 3:
+                        col_samples[col].append(val_str)
+
     for i, col_name in enumerate(metadata.column_names):
         dtype = metadata.column_data_types[i] if i < len(metadata.column_data_types) else "unknown"
-        lines.append(f"  - {col_name} (type: {dtype})")
-
-    if metadata.sample_data:
-        lines.append("")
-        lines.append("Sample Rows (first few rows):")
-        for idx, row in enumerate(metadata.sample_data[:5]):
-            lines.append(f"  Row {idx + 1}: {json.dumps(row, default=str)}")
+        samples = col_samples.get(col_name, [])
+        samples_str = f", samples: {samples}" if samples else ""
+        lines.append(f"  - {col_name} (type: {dtype}{samples_str})")
 
     return "\n".join(lines)
 
@@ -67,20 +165,7 @@ def generate_column_descriptions(metadata: DatasetMetadata) -> dict[str, str]:
 
     context = _build_metadata_context(metadata)
 
-    prompt = f"""You are a data analyst. Given the following dataset metadata, generate a short, 
-clear description (1 sentence) for each column. The description should explain what the column 
-likely represents based on its name, data type, and sample values.
-
-{context}
-
-Return your response as a valid JSON object where keys are column names and values are descriptions.
-Example format:
-{{
-    "Column1": "Description of what Column1 represents",
-    "Column2": "Description of what Column2 represents"
-}}
-
-Return ONLY the JSON object, no other text."""
+    prompt = get_column_descriptions_prompt(context)
 
     try:
         response = client.chat.completions.create(
@@ -144,31 +229,7 @@ def classify_dataset(metadata: DatasetMetadata) -> LLMClassification:
             desc_lines.append(f"  - {col}: {desc}")
         desc_section = "\n".join(desc_lines)
 
-    valid_domains_str = ", ".join(VALID_DOMAINS)
-
-    prompt = f"""You are a business data classification expert. Given the following dataset metadata, 
-classify the dataset into the most appropriate business domain and provide a brief summary.
-
-{context}
-{desc_section}
-
-Valid business domains: {valid_domains_str}
-
-Return your response as a valid JSON object with the following fields:
-- "business_domain": one of the valid domains listed above
-- "dataset_summary": a 1-2 sentence summary of what this dataset contains
-- "confidence": a number between 0.0 and 1.0 indicating classification confidence
-- "reason": a brief explanation of why this domain was chosen
-
-Example:
-{{
-    "business_domain": "Sales",
-    "dataset_summary": "Contains customer orders, products, revenue, and regional sales information.",
-    "confidence": 0.92,
-    "reason": "The dataset contains columns related to revenue, customers, and products, which are typical of sales data."
-}}
-
-Return ONLY the JSON object, no other text."""
+    prompt = get_classify_dataset_prompt(context, desc_section)
 
     try:
         response = client.chat.completions.create(
@@ -197,13 +258,18 @@ Return ONLY the JSON object, no other text."""
 
         result = json.loads(response_text)
 
-        # Validate the domain is in our list
+        # Retrieve classification from LLM response (fallback to defaults if empty/missing)
         domain = result.get("business_domain", "Other")
-        if domain not in VALID_DOMAINS:
+        if not isinstance(domain, str) or not domain.strip():
             domain = "Other"
 
+        sub_domain = result.get("sub_domain", "General")
+        if not isinstance(sub_domain, str) or not sub_domain.strip():
+            sub_domain = "General"
+
         return LLMClassification(
-            business_domain=domain,
+            business_domain=domain.strip(),
+            sub_domain=sub_domain.strip(),
             dataset_summary=result.get("dataset_summary", ""),
             confidence=result.get("confidence"),
             reason=result.get("reason"),
@@ -213,6 +279,7 @@ Return ONLY the JSON object, no other text."""
         logger.warning(f"Failed to parse LLM classification response as JSON: {e}")
         return LLMClassification(
             business_domain="Other",
+            sub_domain="General",
             dataset_summary="Unable to generate summary — LLM response parsing failed.",
             confidence=0.0,
             reason=str(e),
@@ -221,6 +288,7 @@ Return ONLY the JSON object, no other text."""
         logger.error(f"Groq API error during dataset classification: {e}")
         return LLMClassification(
             business_domain="Other",
+            sub_domain="General",
             dataset_summary="Unable to generate summary — LLM service error.",
             confidence=0.0,
             reason=str(e),

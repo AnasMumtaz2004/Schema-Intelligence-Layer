@@ -18,10 +18,19 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 
 from app.config import settings
-from app.services.database import init_db, get_next_dataset_id, insert_metadata, update_metadata_after_classification, get_metadata
+from app.services.database import (
+    init_db,
+    get_next_dataset_id,
+    insert_metadata,
+    update_metadata_after_classification,
+    get_metadata,
+    get_metadata_by_name,
+    update_metadata_after_append,
+)
 from app.services.metadata_extractor import extract_metadata
 from app.services.llm_service import generate_column_descriptions, classify_dataset
 from app.datastore.registry import store_dataframe, get_dataframe
+from app.services.persistence import save_to_dataset_db, read_from_dataset_db
 
 # Configure logging
 logging.basicConfig(
@@ -65,76 +74,128 @@ def process_file(filepath: str) -> dict:
     df = load_file(filepath)
     print(f"      ✓ Loaded: {df.shape[0]} rows × {df.shape[1]} columns")
 
-    # Step 2: Extract metadata
-    print("\n[2/5] Extracting metadata...")
-    dataset_id = get_next_dataset_id()
-    metadata = extract_metadata(df, filename, dataset_id, ext)
-    insert_metadata(metadata)
-    print(f"      ✓ Dataset ID: {dataset_id}")
-    print(f"      ✓ File type: {metadata.file_type}")
-    print(f"      ✓ Columns: {metadata.column_names}")
+    # Check if dataset already exists
+    existing = get_metadata_by_name(filename)
 
-    # Step 3: Generate column descriptions via LLM
-    print("\n[3/5] Generating column descriptions (Groq LLM)...")
-    try:
-        column_descriptions = generate_column_descriptions(metadata)
-        metadata.column_descriptions = column_descriptions
-        print(f"      ✓ Generated descriptions for {len(column_descriptions)} columns")
-    except Exception as e:
-        print(f"      ✗ Failed: {e}")
-        column_descriptions = {col: f"Column '{col}'" for col in metadata.column_names}
-        metadata.column_descriptions = column_descriptions
+    if existing:
+        print(f"\n      ℹ Dataset '{filename}' already exists (ID: {existing.dataset_id}). Appending rows.")
+        # Step 2: Append
+        print("\n[2/5] Appending records to dedicated database...")
+        database_path = save_to_dataset_db(df, filename, mode="append")
+        print(f"      ✓ Appended to database: {database_path}")
 
-    # Step 4: Classify dataset via LLM
-    print("\n[4/5] Classifying business domain (Groq LLM)...")
-    try:
-        classification = classify_dataset(metadata)
-        metadata.business_domain = classification.business_domain
-        metadata.dataset_summary = classification.dataset_summary
-        processing_status = "Completed"
-        print(f"      ✓ Domain: {classification.business_domain}")
-        print(f"      ✓ Summary: {classification.dataset_summary}")
-        if classification.confidence:
-            print(f"      ✓ Confidence: {classification.confidence:.0%}")
-        if classification.reason:
-            print(f"      ✓ Reason: {classification.reason}")
-    except Exception as e:
-        print(f"      ✗ Failed: {e}")
-        metadata.business_domain = "Other"
-        metadata.dataset_summary = "Classification failed."
-        processing_status = "Partial"
+        # Load combined data
+        combined_df = read_from_dataset_db(database_path)
+        new_metadata = extract_metadata(combined_df, filename, existing.dataset_id, ext)
 
-    # Step 5: Store results
-    print("\n[5/5] Storing results...")
-    metadata.processing_status = processing_status
-    update_metadata_after_classification(
-        dataset_id=dataset_id,
-        business_domain=metadata.business_domain,
-        dataset_summary=metadata.dataset_summary,
-        column_descriptions=metadata.column_descriptions,
-        processing_status=processing_status,
-    )
-    store_dataframe(dataset_id, df)
-    print(f"      ✓ Metadata saved to SQLite ({settings.DATABASE_PATH})")
-    print(f"      ✓ DataFrame stored in memory registry")
+        # Step 5: Store results (skipping 3 and 4)
+        print("\n[5/5] Updating metadata catalog...")
+        update_metadata_after_append(
+            dataset_id=existing.dataset_id,
+            row_count=new_metadata.row_count,
+            upload_timestamp=new_metadata.upload_timestamp,
+            sample_data=new_metadata.sample_data,
+            processing_status="Completed",
+        )
+        store_dataframe(existing.dataset_id, combined_df)
+        print(f"      ✓ Catalog updated. Total row count is now {new_metadata.row_count}.")
 
-    # Serialize DataFrame records (full, for downstream handoff)
-    dataframe_records = df.to_dict(orient="records")
+        dataframe_records = combined_df.to_dict(orient="records")
 
-    # Build result summary (mirrors UploadResponse)
-    result = {
-        "dataset_id": metadata.dataset_id,
-        "dataset_name": metadata.dataset_name,
-        "business_domain": metadata.business_domain,
-        "dataset_summary": metadata.dataset_summary,
-        "row_count": metadata.row_count,
-        "column_count": metadata.column_count,
-        "status": metadata.processing_status,
-        "column_names": metadata.column_names,
-        "column_data_types": metadata.column_data_types,
-        "column_descriptions": metadata.column_descriptions,
-        "dataframe_records": dataframe_records,  # full DataFrame for downstream
-    }
+        result = {
+            "dataset_id": existing.dataset_id,
+            "dataset_name": existing.dataset_name,
+            "database_path": database_path,
+            "business_domain": existing.business_domain,
+            "sub_domain": existing.sub_domain,
+            "dataset_summary": existing.dataset_summary,
+            "row_count": new_metadata.row_count,
+            "column_count": existing.column_count,
+            "status": "Completed",
+            "column_descriptions": existing.column_descriptions,
+            "dataframe_records": dataframe_records,
+        }
+
+    else:
+        # Step 2: Extract metadata
+        print("\n[2/5] Extracting metadata...")
+        dataset_id = get_next_dataset_id()
+
+        # Save new dataset file to dedicated DB
+        database_path = save_to_dataset_db(df, filename, mode="replace")
+        print(f"      ✓ Dedicated SQLite database created: {database_path}")
+
+        metadata = extract_metadata(df, filename, dataset_id, ext)
+        metadata.database_path = database_path
+        insert_metadata(metadata)
+        print(f"      ✓ Dataset ID: {dataset_id}")
+        print(f"      ✓ File type: {metadata.file_type}")
+
+        # Step 3: Generate column descriptions via LLM
+        print("\n[3/5] Generating column descriptions (Groq LLM)...")
+        try:
+            column_descriptions = generate_column_descriptions(metadata)
+            metadata.column_descriptions = column_descriptions
+            print(f"      ✓ Generated descriptions for {len(column_descriptions)} columns")
+        except Exception as e:
+            print(f"      ✗ Failed: {e}")
+            column_descriptions = {col: f"Column '{col}'" for col in metadata.column_names}
+            metadata.column_descriptions = column_descriptions
+
+        # Step 4: Classify dataset via LLM
+        print("\n[4/5] Classifying business domain (Groq LLM)...")
+        try:
+            classification = classify_dataset(metadata)
+            metadata.business_domain = classification.business_domain
+            metadata.sub_domain = classification.sub_domain
+            metadata.dataset_summary = classification.dataset_summary
+            processing_status = "Completed"
+            print(f"      ✓ Domain: {classification.business_domain}")
+            print(f"      ✓ Sub-domain: {classification.sub_domain}")
+            print(f"      ✓ Summary: {classification.dataset_summary}")
+            if classification.confidence:
+                print(f"      ✓ Confidence: {classification.confidence:.0%}")
+            if classification.reason:
+                print(f"      ✓ Reason: {classification.reason}")
+        except Exception as e:
+            print(f"      ✗ Failed: {e}")
+            metadata.business_domain = "Other"
+            metadata.sub_domain = "General"
+            metadata.dataset_summary = "Classification failed."
+            processing_status = "Partial"
+
+        # Step 5: Store results
+        print("\n[5/5] Storing results...")
+        metadata.processing_status = processing_status
+        update_metadata_after_classification(
+            dataset_id=dataset_id,
+            business_domain=metadata.business_domain,
+            sub_domain=metadata.sub_domain,
+            dataset_summary=metadata.dataset_summary,
+            column_descriptions=metadata.column_descriptions,
+            processing_status=processing_status,
+        )
+        store_dataframe(dataset_id, df)
+        print(f"      ✓ Metadata saved to SQLite ({settings.DATABASE_PATH})")
+        print(f"      ✓ DataFrame stored in memory registry")
+
+        # Serialize DataFrame records (full, for downstream handoff)
+        dataframe_records = df.to_dict(orient="records")
+
+        # Build result summary (mirrors UploadResponse)
+        result = {
+            "dataset_id": metadata.dataset_id,
+            "dataset_name": metadata.dataset_name,
+            "database_path": database_path,
+            "business_domain": metadata.business_domain,
+            "sub_domain": metadata.sub_domain,
+            "dataset_summary": metadata.dataset_summary,
+            "row_count": metadata.row_count,
+            "column_count": metadata.column_count,
+            "status": metadata.processing_status,
+            "column_descriptions": metadata.column_descriptions,
+            "dataframe_records": dataframe_records,  # full DataFrame for downstream
+        }
 
     # Print final result (metadata only, not full records)
     printable_result = {k: v for k, v in result.items() if k != "dataframe_records"}
@@ -154,6 +215,12 @@ def process_file(filepath: str) -> dict:
 
 
 def main():
+    # Force UTF-8 output encoding for Windows terminals
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8')
+
     # Initialize database
     init_db()
 

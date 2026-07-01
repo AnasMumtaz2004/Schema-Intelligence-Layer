@@ -18,6 +18,7 @@ class ColumnInfo(BaseModel):
 class LLMClassification(BaseModel):
     """Schema for LLM classification output."""
     business_domain: str = "Other"
+    sub_domain: str = "General"
     dataset_summary: str = ""
     confidence: Optional[float] = None
     reason: Optional[str] = None
@@ -29,7 +30,9 @@ class DatasetMetadata(BaseModel):
     dataset_name: str
     file_type: str
     upload_timestamp: str
+    database_path: str = ""
     business_domain: str = "Pending"
+    sub_domain: str = "General"
     dataset_summary: str = ""
     row_count: int
     column_count: int
@@ -44,12 +47,12 @@ class UploadResponse(BaseModel):
     """API response returned after successful dataset upload."""
     dataset_id: str
     dataset_name: str
+    database_path: str
     business_domain: str
+    sub_domain: str
     dataset_summary: str
     row_count: int
     column_count: int
-    column_names: list[str]
-    column_data_types: list[str]
     column_descriptions: dict[str, str]
     status: str
     dataframe_records: list[dict] = Field(
@@ -63,7 +66,9 @@ class DatasetListItem(BaseModel):
     """Summary item for dataset listing endpoint."""
     dataset_id: str
     dataset_name: str
+    database_path: str
     business_domain: str
+    sub_domain: str
     row_count: int
     column_count: int
     upload_timestamp: str
