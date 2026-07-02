@@ -9,10 +9,11 @@ import logging
 from groq import Groq
 
 from app.config import settings
-from app.models.schemas import DatasetMetadata, LLMClassification
+from app.models.schemas import DatasetMetadata, LLMClassification, MVASuitability
 from app.prompts.llm_service_prompt import (
     get_column_descriptions_prompt,
     get_classify_dataset_prompt,
+    get_mva_suitability_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -292,4 +293,89 @@ def classify_dataset(metadata: DatasetMetadata) -> LLMClassification:
             dataset_summary="Unable to generate summary — LLM service error.",
             confidence=0.0,
             reason=str(e),
+        )
+
+
+def score_mva_suitability(metadata: DatasetMetadata, df: pd.DataFrame) -> MVASuitability:
+    """
+    Score the dataset's suitability for Multivariate Analysis (MVA) based on first 20 and last 20 rows.
+    """
+    import pandas as pd
+    client = _get_groq_client()
+
+    context = _build_metadata_context(metadata)
+
+    # Extract first 20 and last 20 rows
+    first_20 = df.head(20)
+    last_20 = df.tail(20)
+
+    # If the dataset is very wide, truncate columns in the sample representation to prevent token rate limits
+    MAX_SAMPLE_COLS = 20
+    if df.shape[1] > MAX_SAMPLE_COLS:
+        first_20_sample = first_20.iloc[:, :MAX_SAMPLE_COLS]
+        last_20_sample = last_20.iloc[:, :MAX_SAMPLE_COLS]
+        col_truncated_msg = f"Note: For the sample rows below, only the first {MAX_SAMPLE_COLS} of {df.shape[1]} columns are displayed to fit within token limits."
+    else:
+        first_20_sample = first_20
+        last_20_sample = last_20
+        col_truncated_msg = ""
+
+    # Convert to CSV format string
+    first_20_str = first_20_sample.to_csv(index=False)
+    last_20_str = last_20_sample.to_csv(index=False)
+
+    prompt = get_mva_suitability_prompt(context, first_20_str, last_20_str, col_truncated_msg)
+
+    try:
+        response = client.chat.completions.create(
+            model=settings.GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a statistics assistant. Always output a single valid JSON block without markdown formatting wrapper tags."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.1,
+            max_tokens=1500,
+        )
+
+        response_text = response.choices[0].message.content.strip()
+
+        # Parse JSON response — handle possible markdown code fences
+        if response_text.startswith("```"):
+            response_text = response_text.strip("`").strip()
+            if response_text.startswith("json"):
+                response_text = response_text[4:].strip()
+
+        result = json.loads(response_text)
+
+        reasoning = result.get("suitability_reasoning", "")
+        if isinstance(reasoning, (dict, list)):
+            reasoning = json.dumps(reasoning, indent=2)
+
+        return MVASuitability(
+            mva_suitability_score=int(result.get("mva_suitability_score", 0)),
+            structural_consistency_score=int(result.get("structural_consistency_score", 0)),
+            structural_consistency_explanation=result.get("structural_consistency_explanation", ""),
+            numerical_variable_density_score=int(result.get("numerical_variable_density_score", 0)),
+            missing_data_risk=result.get("missing_data_risk", "Low"),
+            mva_techniques=result.get("mva_techniques", []),
+            suitability_reasoning=reasoning,
+        )
+
+    except Exception as e:
+        logger.error(f"Groq API error during MVA suitability scoring: {e}")
+        # Fallback response
+        return MVASuitability(
+            mva_suitability_score=0,
+            structural_consistency_score=0,
+            structural_consistency_explanation=f"Error evaluating structural consistency: {str(e)}",
+            numerical_variable_density_score=0,
+            missing_data_risk="High",
+            mva_techniques=[],
+            suitability_reasoning=f"Failed to generate suitability assessment: {str(e)}",
         )

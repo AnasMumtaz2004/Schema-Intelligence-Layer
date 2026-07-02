@@ -90,3 +90,42 @@ Example:
     "confidence": 0.95,
     "reason": "Columns such as transaction_id, amount, and payment_method are typical of payments data."
 }}"""
+
+
+def get_mva_suitability_prompt(
+    context: str,
+    first_20_str: str,
+    last_20_str: str,
+    col_truncated_msg: str,
+) -> str:
+    """
+    Prompt for scoring a dataset's suitability for Multivariate Analysis (MVA).
+    """
+    return f"""You are a senior data scientist and statistician specializing in Multivariate Analysis (MVA).
+Your goal is to evaluate the suitability of the following dataset for Multivariate Analysis (e.g. PCA, Factor Analysis, Multiple Regression, MANOVA, Cluster Analysis, etc.) based ONLY on its basic structure and a sample of its first 20 and last 20 rows.
+
+### Dataset Metadata:
+{context}
+
+{col_truncated_msg}
+
+### Sample - First 20 Rows (CSV Format):
+```csv
+{first_20_str}
+```
+
+### Sample - Last 20 Rows (CSV Format):
+```csv
+{last_20_str}
+```
+
+Please perform a thorough review and provide the response in valid JSON format with the following keys:
+- "mva_suitability_score": int, overall score from 0 to 100 indicating how "good" or suitable this dataset is to send ahead for further Multivariate Analysis.
+- "structural_consistency_score": int, score from 0 to 100 on how consistent the schema and data formats are between the first 20 and last 20 rows (look for schema drift, format shifts, or sudden data alignment problems).
+- "structural_consistency_explanation": string, a brief explanation of structural consistency between the start and end of the dataset.
+- "numerical_variable_density_score": int, score from 0 to 100 indicating the density and availability of numeric/continuous variables (essential for correlation, covariance, variance calculations in MVA).
+- "missing_data_risk": string, risk level ("Low", "Medium", or "High") representing the risk posed by missing/null values in columns.
+- "mva_techniques": list of strings, recommended multivariate techniques (e.g. ["PCA", "Multiple Regression", "Cluster Analysis"]) or why none are recommended.
+- "suitability_reasoning": string, a detailed paragraph explaining the reasoning behind the scores and recommendations, listing what features make it suitable, any potential issues downstream agents will face (e.g. categorical variables needing encoding, scaling requirements, outliers, non-numeric formatting in numeric columns), and a clear final recommendation.
+
+Return your response as a single valid JSON object, and nothing else — no markdown code fences, no ```json wrapper, no preamble, no trailing commentary. The response must start with {{ and end with }}."""

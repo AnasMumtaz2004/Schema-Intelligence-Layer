@@ -28,9 +28,12 @@ from app.services.database import (
     update_metadata_after_append,
 )
 from app.services.metadata_extractor import extract_metadata
-from app.services.llm_service import generate_column_descriptions, classify_dataset
+from app.services.llm_service import (
+    generate_column_descriptions,
+    classify_dataset,
+    score_mva_suitability,
+)
 from app.datastore.registry import store_dataframe, get_dataframe
-from app.services.persistence import save_to_dataset_db, read_from_dataset_db
 
 # Configure logging
 logging.basicConfig(
@@ -79,22 +82,44 @@ def process_file(filepath: str) -> dict:
 
     if existing:
         print(f"\n      ℹ Dataset '{filename}' already exists (ID: {existing.dataset_id}). Appending rows.")
-        # Step 2: Append
-        print("\n[2/5] Appending records to dedicated database...")
-        database_path = save_to_dataset_db(df, filename, mode="append")
-        print(f"      ✓ Appended to database: {database_path}")
-
-        # Load combined data
-        combined_df = read_from_dataset_db(database_path)
+        # Step 2: Combine with the cached in-memory DataFrame, if still present
+        print("\n[2/5] Combining with in-memory dataset...")
+        current_df = get_dataframe(existing.dataset_id)
+        if current_df is not None:
+            combined_df = pd.concat([current_df, df], ignore_index=True)
+        else:
+            print("      ⚠ No cached DataFrame found (server/script restarted) — treating as replacement.")
+            combined_df = df
         new_metadata = extract_metadata(combined_df, filename, existing.dataset_id, ext)
 
-        # Step 5: Store results (skipping 3 and 4)
+        # Generate suitability evaluation for appended dataset
+        print("\n[3/5] Evaluating MVA suitability (Groq LLM) for combined data...")
+        try:
+            mva_suitability = score_mva_suitability(new_metadata, combined_df)
+            print(f"      ✓ MVA Suitability Score: {mva_suitability.mva_suitability_score}/100")
+        except Exception as e:
+            print(f"      ✗ Failed: {e}")
+            mva_suitability = None
+
+        # Step 5: Store results
         print("\n[5/5] Updating metadata catalog...")
         update_metadata_after_append(
             dataset_id=existing.dataset_id,
             row_count=new_metadata.row_count,
+            column_count=new_metadata.column_count,
+            column_names=new_metadata.column_names,
+            column_data_types=new_metadata.column_data_types,
             upload_timestamp=new_metadata.upload_timestamp,
             sample_data=new_metadata.sample_data,
+            processing_status="Completed",
+        )
+        update_metadata_after_classification(
+            dataset_id=existing.dataset_id,
+            business_domain=existing.business_domain,
+            sub_domain=existing.sub_domain,
+            dataset_summary=existing.dataset_summary,
+            column_descriptions=existing.column_descriptions,
+            mva_suitability=mva_suitability,
             processing_status="Completed",
         )
         store_dataframe(existing.dataset_id, combined_df)
@@ -105,14 +130,15 @@ def process_file(filepath: str) -> dict:
         result = {
             "dataset_id": existing.dataset_id,
             "dataset_name": existing.dataset_name,
-            "database_path": database_path,
             "business_domain": existing.business_domain,
             "sub_domain": existing.sub_domain,
             "dataset_summary": existing.dataset_summary,
             "row_count": new_metadata.row_count,
-            "column_count": existing.column_count,
+            "column_count": new_metadata.column_count,
             "status": "Completed",
             "column_descriptions": existing.column_descriptions,
+            "score": mva_suitability.mva_suitability_score if mva_suitability else None,
+            "mva_suitability": mva_suitability.model_dump() if mva_suitability else None,
             "dataframe_records": dataframe_records,
         }
 
@@ -121,12 +147,7 @@ def process_file(filepath: str) -> dict:
         print("\n[2/5] Extracting metadata...")
         dataset_id = get_next_dataset_id()
 
-        # Save new dataset file to dedicated DB
-        database_path = save_to_dataset_db(df, filename, mode="replace")
-        print(f"      ✓ Dedicated SQLite database created: {database_path}")
-
         metadata = extract_metadata(df, filename, dataset_id, ext)
-        metadata.database_path = database_path
         insert_metadata(metadata)
         print(f"      ✓ Dataset ID: {dataset_id}")
         print(f"      ✓ File type: {metadata.file_type}")
@@ -164,6 +185,21 @@ def process_file(filepath: str) -> dict:
             metadata.dataset_summary = "Classification failed."
             processing_status = "Partial"
 
+        # Step 4.5: Score MVA suitability via LLM
+        print("\n[4.5/5] Evaluating MVA suitability (Groq LLM)...")
+        try:
+            mva_suitability = score_mva_suitability(metadata, df)
+            metadata.mva_suitability = mva_suitability
+            print(f"      ✓ MVA Suitability Score: {mva_suitability.mva_suitability_score}/100")
+            print(f"      ✓ Structural Consistency Score: {mva_suitability.structural_consistency_score}/100")
+            print(f"      ✓ Numerical Variable Density Score: {mva_suitability.numerical_variable_density_score}/100")
+            print(f"      ✓ Missing Data Risk: {mva_suitability.missing_data_risk}")
+            print(f"      ✓ Recommended Techniques: {', '.join(mva_suitability.mva_techniques)}")
+            print(f"      ✓ Suitability Reasoning: {mva_suitability.suitability_reasoning}")
+        except Exception as e:
+            print(f"      ✗ Failed: {e}")
+            mva_suitability = None
+
         # Step 5: Store results
         print("\n[5/5] Storing results...")
         metadata.processing_status = processing_status
@@ -173,6 +209,7 @@ def process_file(filepath: str) -> dict:
             sub_domain=metadata.sub_domain,
             dataset_summary=metadata.dataset_summary,
             column_descriptions=metadata.column_descriptions,
+            mva_suitability=mva_suitability,
             processing_status=processing_status,
         )
         store_dataframe(dataset_id, df)
@@ -186,7 +223,6 @@ def process_file(filepath: str) -> dict:
         result = {
             "dataset_id": metadata.dataset_id,
             "dataset_name": metadata.dataset_name,
-            "database_path": database_path,
             "business_domain": metadata.business_domain,
             "sub_domain": metadata.sub_domain,
             "dataset_summary": metadata.dataset_summary,
@@ -194,11 +230,13 @@ def process_file(filepath: str) -> dict:
             "column_count": metadata.column_count,
             "status": metadata.processing_status,
             "column_descriptions": metadata.column_descriptions,
+            "score": mva_suitability.mva_suitability_score if mva_suitability else None,
+            "mva_suitability": mva_suitability.model_dump() if mva_suitability else None,
             "dataframe_records": dataframe_records,  # full DataFrame for downstream
         }
 
     # Print final result (metadata only, not full records)
-    printable_result = {k: v for k, v in result.items() if k != "dataframe_records"}
+    printable_result = {k: v for k, v in result.items() if k not in ("dataframe_records", "column_descriptions")}
     print(f"\n{'─'*70}")
     print("  FINAL RESULT  (metadata + schema)")
     print(f"{'─'*70}")

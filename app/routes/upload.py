@@ -3,13 +3,18 @@ API routes for dataset upload and retrieval.
 """
 
 import logging
+import pandas as pd
 from fastapi import APIRouter, UploadFile, File, HTTPException
 
 from app.models.schemas import UploadResponse, DatasetMetadata, DatasetListItem
 from app.services.validator import validate_upload_file, validate_dataframe
 from app.services.loader import load_dataset
 from app.services.metadata_extractor import extract_metadata
-from app.services.llm_service import generate_column_descriptions, classify_dataset
+from app.services.llm_service import (
+    generate_column_descriptions,
+    classify_dataset,
+    score_mva_suitability,
+)
 from app.services.database import (
     get_next_dataset_id,
     insert_metadata,
@@ -20,7 +25,6 @@ from app.services.database import (
     update_metadata_after_append,
 )
 from app.datastore.registry import store_dataframe, get_dataframe
-from app.services.persistence import save_to_dataset_db, read_from_dataset_db
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +50,9 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
     2. Load into DataFrame
     3. Validate DataFrame structure
     4. Check if file is already uploaded:
-       - If yes: append rows to its dedicated DB, re-extract row counts, and update metadata catalog.
-       - If no: save to dedicated DB, run LLM classification, and insert to metadata catalog.
+       - If yes: combine with the in-memory DataFrame (if still cached), re-extract row counts,
+         and update metadata catalog.
+       - If no: register metadata, run LLM classification, and insert to metadata catalog.
     """
 
     # Step 1: Validate file type
@@ -67,19 +72,49 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
 
     if existing:
         logger.info(f"Dataset '{filename}' already exists (ID: {existing.dataset_id}). Appending rows.")
-        # Append rows to target DB
-        database_path = save_to_dataset_db(df, filename, mode="append")
 
-        # Load combined dataframe to get updated counts and samples
-        combined_df = read_from_dataset_db(database_path)
+        # Combine with the previously cached DataFrame, if it's still in memory.
+        current_df = get_dataframe(existing.dataset_id)
+        if current_df is not None:
+            combined_df = pd.concat([current_df, df], ignore_index=True)
+        else:
+            logger.warning(
+                f"No cached DataFrame found for {existing.dataset_id} "
+                "(server likely restarted) — prior rows are unavailable, treating upload as a replacement."
+            )
+            combined_df = df
+
         new_metadata = extract_metadata(combined_df, filename, existing.dataset_id, file_extension)
 
+        # Generate suitability evaluation for appended dataset
+        try:
+            mva_suitability = score_mva_suitability(new_metadata, combined_df)
+            new_metadata.mva_suitability = mva_suitability
+        except Exception as e:
+            logger.warning(f"MVA suitability scoring failed for {existing.dataset_id}: {e}")
+            mva_suitability = None
+
         # Update metadata in catalog database
+        # To persist suitability we'll perform the classification update since update_metadata_after_append
+        # does not write suitability.
         update_metadata_after_append(
             dataset_id=existing.dataset_id,
             row_count=new_metadata.row_count,
+            column_count=new_metadata.column_count,
+            column_names=new_metadata.column_names,
+            column_data_types=new_metadata.column_data_types,
             upload_timestamp=new_metadata.upload_timestamp,
             sample_data=new_metadata.sample_data,
+            processing_status="Completed",
+        )
+
+        update_metadata_after_classification(
+            dataset_id=existing.dataset_id,
+            business_domain=existing.business_domain,
+            sub_domain=existing.sub_domain,
+            dataset_summary=existing.dataset_summary,
+            column_descriptions=existing.column_descriptions,
+            mva_suitability=mva_suitability,
             processing_status="Completed",
         )
 
@@ -92,28 +127,25 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
         return UploadResponse(
             dataset_id=existing.dataset_id,
             dataset_name=existing.dataset_name,
-            database_path=database_path,
             business_domain=existing.business_domain,
             sub_domain=existing.sub_domain,
             dataset_summary=existing.dataset_summary,
             row_count=new_metadata.row_count,
-            column_count=existing.column_count,
+            column_count=new_metadata.column_count,
             column_descriptions=existing.column_descriptions,
             status="Completed",
             dataframe_records=dataframe_records,
+            mva_suitability=mva_suitability,
+            score=mva_suitability.mva_suitability_score if mva_suitability else None,
         )
 
     else:
-        logger.info(f"Dataset '{filename}' is new. Creating metadata catalog and dedicated database.")
+        logger.info(f"Dataset '{filename}' is new. Creating metadata catalog entry.")
         # Generate new dataset ID
         dataset_id = get_next_dataset_id()
 
-        # Save to dedicated SQLite database (mode="replace" to ensure clean table)
-        database_path = save_to_dataset_db(df, filename, mode="replace")
-
         # Extract initial metadata
         metadata = extract_metadata(df, filename, dataset_id, file_extension)
-        metadata.database_path = database_path
 
         # Insert initial metadata row (status = Processing)
         insert_metadata(metadata)
@@ -146,6 +178,15 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             metadata.dataset_summary = "Classification failed — domain could not be determined."
             processing_status = "Partial"
 
+        # Generate suitability evaluation for new dataset
+        try:
+            mva_suitability = score_mva_suitability(metadata, df)
+            metadata.mva_suitability = mva_suitability
+            logger.info(f"Generated MVA suitability score: {mva_suitability.mva_suitability_score} for {dataset_id}")
+        except Exception as e:
+            logger.warning(f"MVA suitability scoring failed for {dataset_id}: {e}")
+            mva_suitability = None
+
         # Update metadata in catalog database
         metadata.processing_status = processing_status
         update_metadata_after_classification(
@@ -154,6 +195,7 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             sub_domain=metadata.sub_domain,
             dataset_summary=metadata.dataset_summary,
             column_descriptions=metadata.column_descriptions,
+            mva_suitability=mva_suitability,
             processing_status=processing_status,
         )
 
@@ -166,7 +208,6 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
         return UploadResponse(
             dataset_id=metadata.dataset_id,
             dataset_name=metadata.dataset_name,
-            database_path=database_path,
             business_domain=metadata.business_domain,
             sub_domain=metadata.sub_domain,
             dataset_summary=metadata.dataset_summary,
@@ -175,6 +216,8 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             column_descriptions=metadata.column_descriptions,
             status=metadata.processing_status,
             dataframe_records=dataframe_records,
+            mva_suitability=mva_suitability,
+            score=mva_suitability.mva_suitability_score if mva_suitability else None,
         )
 
 
@@ -191,7 +234,6 @@ async def list_datasets():
         DatasetListItem(
             dataset_id=m.dataset_id,
             dataset_name=m.dataset_name,
-            database_path=m.database_path,
             business_domain=m.business_domain,
             sub_domain=m.sub_domain,
             row_count=m.row_count,
@@ -235,20 +277,11 @@ async def get_dataset_dataframe(dataset_id: str, limit: int = 100):
     """
     df = get_dataframe(dataset_id)
     if df is None:
-        metadata = get_metadata(dataset_id)
-        if metadata and metadata.database_path:
-            try:
-                df = read_from_dataset_db(metadata.database_path)
-                store_dataframe(dataset_id, df)
-                logger.info(f"Loaded DataFrame for {dataset_id} from {metadata.database_path}")
-            except Exception as e:
-                logger.error(f"Failed to load dataset from dedicated database {metadata.database_path}: {e}")
-
-    if df is None:
         raise HTTPException(
             status_code=404,
-            detail=f"DataFrame for '{dataset_id}' not found. "
-                   "The database file might be missing or corrupted."
+            detail=f"DataFrame for '{dataset_id}' not found in memory. "
+                   "It may have been evicted or the server restarted since it was uploaded — "
+                   "re-upload the file to restore it."
         )
 
     if limit > 0:

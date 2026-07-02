@@ -25,19 +25,23 @@ CREATE TABLE IF NOT EXISTS dataset_metadata (
     dataset_summary TEXT DEFAULT '',
     row_count INTEGER NOT NULL,
     column_count INTEGER NOT NULL,
+    column_names TEXT DEFAULT '[]',
+    column_data_types TEXT DEFAULT '[]',
     column_descriptions TEXT DEFAULT '{}',
     sample_data TEXT DEFAULT '[]',
-    database_path TEXT DEFAULT '',
-    processing_status TEXT DEFAULT 'Processing'
+    processing_status TEXT DEFAULT 'Processing',
+    mva_suitability TEXT DEFAULT NULL,
+    score INTEGER DEFAULT NULL
 );
 """
 
 INSERT_METADATA_SQL = """
 INSERT INTO dataset_metadata (
-    dataset_id, dataset_name, file_type, upload_timestamp, database_path,
+    dataset_id, dataset_name, file_type, upload_timestamp,
     business_domain, sub_domain, dataset_summary, row_count, column_count,
-    column_descriptions, sample_data, processing_status
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    column_names, column_data_types, column_descriptions, sample_data, processing_status,
+    mva_suitability, score
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
 UPDATE_METADATA_SQL = """
@@ -46,6 +50,20 @@ SET business_domain = ?,
     sub_domain = ?,
     dataset_summary = ?,
     column_descriptions = ?,
+    mva_suitability = ?,
+    score = ?,
+    processing_status = ?
+WHERE dataset_id = ?;
+"""
+
+UPDATE_AFTER_APPEND_SQL = """
+UPDATE dataset_metadata
+SET row_count = ?,
+    column_count = ?,
+    column_names = ?,
+    column_data_types = ?,
+    upload_timestamp = ?,
+    sample_data = ?,
     processing_status = ?
 WHERE dataset_id = ?;
 """
@@ -81,10 +99,28 @@ def init_db() -> None:
             logger.info("Migrated database: added 'sub_domain' column.")
         except Exception:
             pass  # Column already exists — safe to ignore
-        # Migration: add database_path column to existing databases
+        # Migration: add column_names/column_data_types to existing databases that predate them
         try:
-            conn.execute("ALTER TABLE dataset_metadata ADD COLUMN database_path TEXT DEFAULT ''")
-            logger.info("Migrated database: added 'database_path' column.")
+            conn.execute("ALTER TABLE dataset_metadata ADD COLUMN column_names TEXT DEFAULT '[]'")
+            logger.info("Migrated database: added 'column_names' column.")
+        except Exception:
+            pass
+        # Migration: add column_data_types to existing databases that predate them
+        try:
+            conn.execute("ALTER TABLE dataset_metadata ADD COLUMN column_data_types TEXT DEFAULT '[]'")
+            logger.info("Migrated database: added 'column_data_types' column.")
+        except Exception:
+            pass  # Column already exists — safe to ignore
+        # Migration: add mva_suitability to existing databases that predate it
+        try:
+            conn.execute("ALTER TABLE dataset_metadata ADD COLUMN mva_suitability TEXT DEFAULT NULL")
+            logger.info("Migrated database: added 'mva_suitability' column.")
+        except Exception:
+            pass  # Column already exists — safe to ignore
+        # Migration: add score to existing databases that predate it
+        try:
+            conn.execute("ALTER TABLE dataset_metadata ADD COLUMN score INTEGER DEFAULT NULL")
+            logger.info("Migrated database: added 'score' column.")
         except Exception:
             pass  # Column already exists — safe to ignore
         conn.commit()
@@ -118,20 +154,25 @@ def insert_metadata(metadata: DatasetMetadata) -> None:
     """
     conn = _get_connection()
     try:
+        mva_json = json.dumps(metadata.mva_suitability.model_dump()) if metadata.mva_suitability else None
+        score_val = metadata.score
         conn.execute(INSERT_METADATA_SQL, (
             metadata.dataset_id,
             metadata.dataset_name,
             metadata.file_type,
             metadata.upload_timestamp,
-            metadata.database_path,
             metadata.business_domain,
             metadata.sub_domain,
             metadata.dataset_summary,
             metadata.row_count,
             metadata.column_count,
+            json.dumps(metadata.column_names),
+            json.dumps(metadata.column_data_types),
             json.dumps(metadata.column_descriptions),
             json.dumps(metadata.sample_data, default=str),
             metadata.processing_status,
+            mva_json,
+            score_val,
         ))
         conn.commit()
         logger.info(f"Inserted metadata for dataset {metadata.dataset_id}")
@@ -148,26 +189,34 @@ def update_metadata_after_classification(
     sub_domain: str,
     dataset_summary: str,
     column_descriptions: dict[str, str],
+    mva_suitability: Optional[DatasetMetadata] = None, # Allow passing MVASuitability or DatasetMetadata's dict/model
     processing_status: str = "Completed",
 ) -> None:
     """
-    Update metadata after LLM classification completes.
-
-    Args:
-        dataset_id: The dataset identifier.
-        business_domain: Classified business domain.
-        sub_domain: Classified sub-domain within the business domain.
-        dataset_summary: LLM-generated summary.
-        column_descriptions: Generated column descriptions.
-        processing_status: Processing status string.
+    Update metadata after LLM classification and analysis completes.
     """
     conn = _get_connection()
     try:
+        mva_json = None
+        score_val = None
+        if mva_suitability:
+            if hasattr(mva_suitability, "model_dump"):
+                mva_json = json.dumps(mva_suitability.model_dump())
+                score_val = getattr(mva_suitability, "mva_suitability_score", None)
+            elif isinstance(mva_suitability, dict):
+                mva_json = json.dumps(mva_suitability)
+                score_val = mva_suitability.get("mva_suitability_score")
+            else:
+                mva_json = json.dumps(dict(mva_suitability))
+                score_val = dict(mva_suitability).get("mva_suitability_score")
+
         conn.execute(UPDATE_METADATA_SQL, (
             business_domain,
             sub_domain,
             dataset_summary,
             json.dumps(column_descriptions),
+            mva_json,
+            score_val,
             processing_status,
             dataset_id,
         ))
@@ -180,45 +229,37 @@ def update_metadata_after_classification(
         conn.close()
 
 
-def get_columns_from_db(db_path: str) -> tuple[list[str], list[str]]:
-    """Query schema info dynamically from the dedicated dataset database."""
-    import os
-    if not db_path or not os.path.exists(db_path):
-        return [], []
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.execute("PRAGMA table_info(data);")
-        rows = cursor.fetchall()
-        conn.close()
-        # Row format for table_info: (cid, name, type, notnull, dflt_value, pk)
-        names = [r[1] for r in rows]
-        types = [r[2] for r in rows]
-        return names, types
-    except Exception:
-        return [], []
-
-
 def _row_to_metadata(row: sqlite3.Row) -> DatasetMetadata:
     """Convert a database row to a DatasetMetadata object."""
-    db_path = row["database_path"] if "database_path" in row.keys() and row["database_path"] else ""
-    names, types = get_columns_from_db(db_path)
+    from app.models.schemas import MVASuitability
+    
+    mva_raw = row["mva_suitability"] if "mva_suitability" in row.keys() else None
+    mva_suitability = None
+    if mva_raw:
+        try:
+            mva_suitability = MVASuitability(**json.loads(mva_raw))
+        except Exception as e:
+            logger.warning(f"Failed to deserialize mva_suitability for dataset {row['dataset_id']}: {e}")
+
+    score_val = row["score"] if "score" in row.keys() else None
 
     return DatasetMetadata(
         dataset_id=row["dataset_id"],
         dataset_name=row["dataset_name"],
         file_type=row["file_type"],
         upload_timestamp=row["upload_timestamp"],
-        database_path=db_path,
         business_domain=row["business_domain"],
         sub_domain=row["sub_domain"] if row["sub_domain"] else "General",
         dataset_summary=row["dataset_summary"],
         row_count=row["row_count"],
         column_count=row["column_count"],
-        column_names=names,
-        column_data_types=types,
+        column_names=json.loads(row["column_names"]) if row["column_names"] else [],
+        column_data_types=json.loads(row["column_data_types"]) if row["column_data_types"] else [],
         column_descriptions=json.loads(row["column_descriptions"]),
         sample_data=json.loads(row["sample_data"]),
         processing_status=row["processing_status"],
+        mva_suitability=mva_suitability,
+        score=score_val,
     )
 
 
@@ -270,22 +311,21 @@ def get_metadata_by_name(filename: str) -> Optional[DatasetMetadata]:
 def update_metadata_after_append(
     dataset_id: str,
     row_count: int,
+    column_count: int,
+    column_names: list[str],
+    column_data_types: list[str],
     upload_timestamp: str,
     sample_data: list[dict],
     processing_status: str = "Completed",
 ) -> None:
-    """Update metadata fields after appending new data to the dataset's database."""
+    """Update metadata fields after appending new rows to an in-memory dataset."""
     conn = _get_connection()
     try:
-        conn.execute("""
-            UPDATE dataset_metadata
-            SET row_count = ?,
-                upload_timestamp = ?,
-                sample_data = ?,
-                processing_status = ?
-            WHERE dataset_id = ?;
-        """, (
+        conn.execute(UPDATE_AFTER_APPEND_SQL, (
             row_count,
+            column_count,
+            json.dumps(column_names),
+            json.dumps(column_data_types),
             upload_timestamp,
             json.dumps(sample_data, default=str),
             processing_status,
