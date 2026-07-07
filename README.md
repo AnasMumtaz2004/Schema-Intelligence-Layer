@@ -26,18 +26,26 @@ Schema_Intelligence_layer/
 ├── requirements.txt               # Project dependencies
 ├── .env.example                   # Environment configuration template
 └── README.md                      # Project documentation
-```
-
 
 ---
+
 
 ## API Endpoints
 
 | Method | Endpoint | Description |
 |---|---|---|
+<<<<<<< HEAD
 | `POST` | `/upload-dataset` | Ingests a dataset, executes metadata extraction, domain classification, MVA suitability scoring, and stores it in the database. |
 | `GET` | `/datasets` | Returns a list of all cataloged datasets with high-level summaries. |
 | `GET` | `/datasets/{dataset_id}` | Retrieves the full metadata record (including column descriptions and suitability statistics). |
 | `GET` | `/datasets/{dataset_id}/dataframe` | Returns the raw cached dataset rows as JSON (accepts a `limit` query parameter). |
 | `GET` | `/health` | API health check. |
 
+=======
+| `POST` | `/upload-dataset` | Ingests a dataset, executes metadata extraction, domain classification, and stores it in the database. |
+| `GET` | `/datasets` | Returns a list of all cataloged datasets with high-level summaries. |
+| `GET` | `/datasets/{dataset_id}` | Retrieves the full metadata record (including column descriptions). |
+| `GET` | `/datasets/{dataset_id}/dataframe` | Returns the raw cached dataset rows as JSON (accepts a `limit` query parameter). |
+| `GET` | `/health` | API health check. |
+
+---

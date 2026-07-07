@@ -154,8 +154,8 @@ def insert_metadata(metadata: DatasetMetadata) -> None:
     """
     conn = _get_connection()
     try:
-        mva_json = json.dumps(metadata.mva_suitability.model_dump()) if metadata.mva_suitability else None
-        score_val = metadata.score
+        mva_json = None
+        score_val = None
         conn.execute(INSERT_METADATA_SQL, (
             metadata.dataset_id,
             metadata.dataset_name,
@@ -189,7 +189,6 @@ def update_metadata_after_classification(
     sub_domain: str,
     dataset_summary: str,
     column_descriptions: dict[str, str],
-    mva_suitability: Optional[DatasetMetadata] = None, # Allow passing MVASuitability or DatasetMetadata's dict/model
     processing_status: str = "Completed",
 ) -> None:
     """
@@ -199,16 +198,6 @@ def update_metadata_after_classification(
     try:
         mva_json = None
         score_val = None
-        if mva_suitability:
-            if hasattr(mva_suitability, "model_dump"):
-                mva_json = json.dumps(mva_suitability.model_dump())
-                score_val = getattr(mva_suitability, "mva_suitability_score", None)
-            elif isinstance(mva_suitability, dict):
-                mva_json = json.dumps(mva_suitability)
-                score_val = mva_suitability.get("mva_suitability_score")
-            else:
-                mva_json = json.dumps(dict(mva_suitability))
-                score_val = dict(mva_suitability).get("mva_suitability_score")
 
         conn.execute(UPDATE_METADATA_SQL, (
             business_domain,
@@ -231,18 +220,6 @@ def update_metadata_after_classification(
 
 def _row_to_metadata(row: sqlite3.Row) -> DatasetMetadata:
     """Convert a database row to a DatasetMetadata object."""
-    from app.models.schemas import MVASuitability
-    
-    mva_raw = row["mva_suitability"] if "mva_suitability" in row.keys() else None
-    mva_suitability = None
-    if mva_raw:
-        try:
-            mva_suitability = MVASuitability(**json.loads(mva_raw))
-        except Exception as e:
-            logger.warning(f"Failed to deserialize mva_suitability for dataset {row['dataset_id']}: {e}")
-
-    score_val = row["score"] if "score" in row.keys() else None
-
     return DatasetMetadata(
         dataset_id=row["dataset_id"],
         dataset_name=row["dataset_name"],
@@ -258,8 +235,6 @@ def _row_to_metadata(row: sqlite3.Row) -> DatasetMetadata:
         column_descriptions=json.loads(row["column_descriptions"]),
         sample_data=json.loads(row["sample_data"]),
         processing_status=row["processing_status"],
-        mva_suitability=mva_suitability,
-        score=score_val,
     )
 
 

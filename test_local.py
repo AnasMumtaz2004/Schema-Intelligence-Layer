@@ -31,7 +31,6 @@ from app.services.metadata_extractor import extract_metadata
 from app.services.llm_service import (
     generate_column_descriptions,
     classify_dataset,
-    score_mva_suitability,
 )
 from app.datastore.registry import store_dataframe, get_dataframe
 
@@ -92,15 +91,6 @@ def process_file(filepath: str) -> dict:
             combined_df = df
         new_metadata = extract_metadata(combined_df, filename, existing.dataset_id, ext)
 
-        # Generate suitability evaluation for appended dataset
-        print("\n[3/5] Evaluating MVA suitability (Groq LLM) for combined data...")
-        try:
-            mva_suitability = score_mva_suitability(new_metadata, combined_df)
-            print(f"      ✓ MVA Suitability Score: {mva_suitability.mva_suitability_score}/100")
-        except Exception as e:
-            print(f"      ✗ Failed: {e}")
-            mva_suitability = None
-
         # Step 5: Store results
         print("\n[5/5] Updating metadata catalog...")
         update_metadata_after_append(
@@ -119,7 +109,6 @@ def process_file(filepath: str) -> dict:
             sub_domain=existing.sub_domain,
             dataset_summary=existing.dataset_summary,
             column_descriptions=existing.column_descriptions,
-            mva_suitability=mva_suitability,
             processing_status="Completed",
         )
         store_dataframe(existing.dataset_id, combined_df)
@@ -137,8 +126,6 @@ def process_file(filepath: str) -> dict:
             "column_count": new_metadata.column_count,
             "status": "Completed",
             "column_descriptions": existing.column_descriptions,
-            "score": mva_suitability.mva_suitability_score if mva_suitability else None,
-            "mva_suitability": mva_suitability.model_dump() if mva_suitability else None,
             "dataframe_records": dataframe_records,
         }
 
@@ -185,21 +172,6 @@ def process_file(filepath: str) -> dict:
             metadata.dataset_summary = "Classification failed."
             processing_status = "Partial"
 
-        # Step 4.5: Score MVA suitability via LLM
-        print("\n[4.5/5] Evaluating MVA suitability (Groq LLM)...")
-        try:
-            mva_suitability = score_mva_suitability(metadata, df)
-            metadata.mva_suitability = mva_suitability
-            print(f"      ✓ MVA Suitability Score: {mva_suitability.mva_suitability_score}/100")
-            print(f"      ✓ Structural Consistency Score: {mva_suitability.structural_consistency_score}/100")
-            print(f"      ✓ Numerical Variable Density Score: {mva_suitability.numerical_variable_density_score}/100")
-            print(f"      ✓ Missing Data Risk: {mva_suitability.missing_data_risk}")
-            print(f"      ✓ Recommended Techniques: {', '.join(mva_suitability.mva_techniques)}")
-            print(f"      ✓ Suitability Reasoning: {mva_suitability.suitability_reasoning}")
-        except Exception as e:
-            print(f"      ✗ Failed: {e}")
-            mva_suitability = None
-
         # Step 5: Store results
         print("\n[5/5] Storing results...")
         metadata.processing_status = processing_status
@@ -209,7 +181,6 @@ def process_file(filepath: str) -> dict:
             sub_domain=metadata.sub_domain,
             dataset_summary=metadata.dataset_summary,
             column_descriptions=metadata.column_descriptions,
-            mva_suitability=mva_suitability,
             processing_status=processing_status,
         )
         store_dataframe(dataset_id, df)
@@ -230,8 +201,6 @@ def process_file(filepath: str) -> dict:
             "column_count": metadata.column_count,
             "status": metadata.processing_status,
             "column_descriptions": metadata.column_descriptions,
-            "score": mva_suitability.mva_suitability_score if mva_suitability else None,
-            "mva_suitability": mva_suitability.model_dump() if mva_suitability else None,
             "dataframe_records": dataframe_records,  # full DataFrame for downstream
         }
 

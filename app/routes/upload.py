@@ -13,7 +13,6 @@ from app.services.metadata_extractor import extract_metadata
 from app.services.llm_service import (
     generate_column_descriptions,
     classify_dataset,
-    score_mva_suitability,
 )
 from app.services.database import (
     get_next_dataset_id,
@@ -86,14 +85,6 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
 
         new_metadata = extract_metadata(combined_df, filename, existing.dataset_id, file_extension)
 
-        # Generate suitability evaluation for appended dataset
-        try:
-            mva_suitability = score_mva_suitability(new_metadata, combined_df)
-            new_metadata.mva_suitability = mva_suitability
-        except Exception as e:
-            logger.warning(f"MVA suitability scoring failed for {existing.dataset_id}: {e}")
-            mva_suitability = None
-
         # Update metadata in catalog database
         # To persist suitability we'll perform the classification update since update_metadata_after_append
         # does not write suitability.
@@ -114,7 +105,6 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             sub_domain=existing.sub_domain,
             dataset_summary=existing.dataset_summary,
             column_descriptions=existing.column_descriptions,
-            mva_suitability=mva_suitability,
             processing_status="Completed",
         )
 
@@ -135,8 +125,6 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             column_descriptions=existing.column_descriptions,
             status="Completed",
             dataframe_records=dataframe_records,
-            mva_suitability=mva_suitability,
-            score=mva_suitability.mva_suitability_score if mva_suitability else None,
         )
 
     else:
@@ -178,15 +166,6 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             metadata.dataset_summary = "Classification failed — domain could not be determined."
             processing_status = "Partial"
 
-        # Generate suitability evaluation for new dataset
-        try:
-            mva_suitability = score_mva_suitability(metadata, df)
-            metadata.mva_suitability = mva_suitability
-            logger.info(f"Generated MVA suitability score: {mva_suitability.mva_suitability_score} for {dataset_id}")
-        except Exception as e:
-            logger.warning(f"MVA suitability scoring failed for {dataset_id}: {e}")
-            mva_suitability = None
-
         # Update metadata in catalog database
         metadata.processing_status = processing_status
         update_metadata_after_classification(
@@ -195,7 +174,6 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             sub_domain=metadata.sub_domain,
             dataset_summary=metadata.dataset_summary,
             column_descriptions=metadata.column_descriptions,
-            mva_suitability=mva_suitability,
             processing_status=processing_status,
         )
 
@@ -216,8 +194,6 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             column_descriptions=metadata.column_descriptions,
             status=metadata.processing_status,
             dataframe_records=dataframe_records,
-            mva_suitability=mva_suitability,
-            score=mva_suitability.mva_suitability_score if mva_suitability else None,
         )
 
 
