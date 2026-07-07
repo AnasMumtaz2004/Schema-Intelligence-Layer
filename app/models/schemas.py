@@ -24,6 +24,22 @@ class LLMClassification(BaseModel):
     reason: Optional[str] = None
 
 
+class QualitySummary(BaseModel):
+    """Summary of data quality analysis."""
+    rows_analyzed: int
+    columns: int
+
+
+class QualityReport(BaseModel):
+    """Data quality validation report."""
+    dataset_score: float
+    passing_score: float
+    decision: str
+    summary: QualitySummary
+    checks: dict[str, float]
+    warnings: list[str]
+
+
 class DatasetMetadata(BaseModel):
     """Complete metadata record for a dataset."""
     dataset_id: str
@@ -40,6 +56,8 @@ class DatasetMetadata(BaseModel):
     column_descriptions: dict[str, str] = {}
     sample_data: list[dict] = []
     processing_status: str = "Processing"
+    quality_score: Optional[float] = None
+    quality_report: Optional[QualityReport] = None
 
 
 class UploadResponse(BaseModel):
@@ -58,6 +76,7 @@ class UploadResponse(BaseModel):
         description="Full dataset as a list of row records (dict per row). "
                     "Intended for downstream agent consumption."
     )
+    quality_report: Optional[QualityReport] = None
 
 
 class DatasetListItem(BaseModel):

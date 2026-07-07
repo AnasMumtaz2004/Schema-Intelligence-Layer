@@ -33,6 +33,7 @@ from app.services.llm_service import (
     classify_dataset,
 )
 from app.datastore.registry import store_dataframe, get_dataframe
+from app.services.quality_validator import DataQualityValidator
 
 # Configure logging
 logging.basicConfig(
@@ -76,6 +77,41 @@ def process_file(filepath: str) -> dict:
     df = load_file(filepath)
     print(f"      ✓ Loaded: {df.shape[0]} rows × {df.shape[1]} columns")
 
+    # Step 1.5: Run Data Quality Validator
+    quality_validator = DataQualityValidator()
+    report = quality_validator.run_validation(df)
+
+    print("\n[1.5/5] Running Data Quality Validator...")
+    print(f"      ✓ Score achieved: {report['dataset_score']} (Passing: {report['passing_score']})")
+    print(f"      ✓ Decision: {report['decision']}")
+    if report["warnings"]:
+        print("      ⚠ Warnings:")
+        for w in report["warnings"]:
+            print(f"        - {w}")
+
+    if report["decision"] == "FAIL":
+        print(f"\n      ✗ Data quality validation failed. Aborting pipeline.")
+        result = {
+            "dataset_id": "N/A",
+            "dataset_name": filename,
+            "business_domain": "N/A",
+            "sub_domain": "N/A",
+            "dataset_summary": "Validation failed.",
+            "row_count": len(df),
+            "column_count": len(df.columns),
+            "status": "FAIL",
+            "dataframe_records": [],
+        }
+        
+        # Print final result (metadata only, not full records)
+        printable_result = {k: v for k, v in result.items() if k not in ("dataframe_records", "column_descriptions")}
+        print(f"\n{'─'*70}")
+        print("  FINAL RESULT  (Validation Failed)")
+        print(f"{'─'*70}")
+        print(json.dumps(printable_result, indent=2))
+        print(f"{'─'*70}\n")
+        return result
+
     # Check if dataset already exists
     existing = get_metadata_by_name(filename)
 
@@ -103,12 +139,17 @@ def process_file(filepath: str) -> dict:
             sample_data=new_metadata.sample_data,
             processing_status="Completed",
         )
+        new_metadata.quality_score = report["dataset_score"]
+        new_metadata.quality_report = report
+
         update_metadata_after_classification(
             dataset_id=existing.dataset_id,
             business_domain=existing.business_domain,
             sub_domain=existing.sub_domain,
             dataset_summary=existing.dataset_summary,
             column_descriptions=existing.column_descriptions,
+            quality_score=report["dataset_score"],
+            quality_report=report,
             processing_status="Completed",
         )
         store_dataframe(existing.dataset_id, combined_df)
@@ -135,6 +176,9 @@ def process_file(filepath: str) -> dict:
         dataset_id = get_next_dataset_id()
 
         metadata = extract_metadata(df, filename, dataset_id, ext)
+        metadata.quality_score = report["dataset_score"]
+        metadata.quality_report = report
+        
         insert_metadata(metadata)
         print(f"      ✓ Dataset ID: {dataset_id}")
         print(f"      ✓ File type: {metadata.file_type}")
@@ -181,6 +225,8 @@ def process_file(filepath: str) -> dict:
             sub_domain=metadata.sub_domain,
             dataset_summary=metadata.dataset_summary,
             column_descriptions=metadata.column_descriptions,
+            quality_score=report["dataset_score"],
+            quality_report=report,
             processing_status=processing_status,
         )
         store_dataframe(dataset_id, df)

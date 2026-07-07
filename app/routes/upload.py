@@ -4,7 +4,10 @@ API routes for dataset upload and retrieval.
 
 import logging
 import pandas as pd
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, status
+from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
+from app.services.quality_validator import DataQualityValidator
 
 from app.models.schemas import UploadResponse, DatasetMetadata, DatasetListItem
 from app.services.validator import validate_upload_file, validate_dataframe
@@ -66,6 +69,19 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
     filename = file.filename or "unknown"
     validate_dataframe(df, filename)
 
+    # Step 3.5: Run Data Quality Validator
+    quality_validator = DataQualityValidator()
+    report = quality_validator.run_validation(df)
+
+    if report["decision"] == "FAIL":
+        logger.warning(
+            f"Dataset '{filename}' failed data quality validation (Score: {report['dataset_score']}/{report['passing_score']}). Aborting."
+        )
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content=jsonable_encoder(report),
+        )
+
     # Step 4: Check if file already exists
     existing = get_metadata_by_name(filename)
 
@@ -99,12 +115,17 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             processing_status="Completed",
         )
 
+        new_metadata.quality_score = report["dataset_score"]
+        new_metadata.quality_report = report
+
         update_metadata_after_classification(
             dataset_id=existing.dataset_id,
             business_domain=existing.business_domain,
             sub_domain=existing.sub_domain,
             dataset_summary=existing.dataset_summary,
             column_descriptions=existing.column_descriptions,
+            quality_score=report["dataset_score"],
+            quality_report=report,
             processing_status="Completed",
         )
 
@@ -125,6 +146,7 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             column_descriptions=existing.column_descriptions,
             status="Completed",
             dataframe_records=dataframe_records,
+            quality_report=report,
         )
 
     else:
@@ -134,6 +156,8 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
 
         # Extract initial metadata
         metadata = extract_metadata(df, filename, dataset_id, file_extension)
+        metadata.quality_score = report["dataset_score"]
+        metadata.quality_report = report
 
         # Insert initial metadata row (status = Processing)
         insert_metadata(metadata)
@@ -174,6 +198,8 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             sub_domain=metadata.sub_domain,
             dataset_summary=metadata.dataset_summary,
             column_descriptions=metadata.column_descriptions,
+            quality_score=report["dataset_score"],
+            quality_report=report,
             processing_status=processing_status,
         )
 
@@ -194,6 +220,7 @@ async def upload_dataset(file: UploadFile = File(..., description="CSV or Excel 
             column_descriptions=metadata.column_descriptions,
             status=metadata.processing_status,
             dataframe_records=dataframe_records,
+            quality_report=report,
         )
 
 

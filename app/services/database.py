@@ -6,7 +6,7 @@ Manages the dataset_catalog.db for storing dataset metadata.
 import json
 import sqlite3
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from app.config import settings
 from app.models.schemas import DatasetMetadata
@@ -30,8 +30,8 @@ CREATE TABLE IF NOT EXISTS dataset_metadata (
     column_descriptions TEXT DEFAULT '{}',
     sample_data TEXT DEFAULT '[]',
     processing_status TEXT DEFAULT 'Processing',
-    mva_suitability TEXT DEFAULT NULL,
-    score INTEGER DEFAULT NULL
+    quality_report TEXT DEFAULT NULL,
+    quality_score REAL DEFAULT NULL
 );
 """
 
@@ -40,7 +40,7 @@ INSERT INTO dataset_metadata (
     dataset_id, dataset_name, file_type, upload_timestamp,
     business_domain, sub_domain, dataset_summary, row_count, column_count,
     column_names, column_data_types, column_descriptions, sample_data, processing_status,
-    mva_suitability, score
+    quality_report, quality_score
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
@@ -50,8 +50,8 @@ SET business_domain = ?,
     sub_domain = ?,
     dataset_summary = ?,
     column_descriptions = ?,
-    mva_suitability = ?,
-    score = ?,
+    quality_report = ?,
+    quality_score = ?,
     processing_status = ?
 WHERE dataset_id = ?;
 """
@@ -111,18 +111,25 @@ def init_db() -> None:
             logger.info("Migrated database: added 'column_data_types' column.")
         except Exception:
             pass  # Column already exists — safe to ignore
-        # Migration: add mva_suitability to existing databases that predate it
+        # Migration: add quality_report to existing databases
         try:
-            conn.execute("ALTER TABLE dataset_metadata ADD COLUMN mva_suitability TEXT DEFAULT NULL")
-            logger.info("Migrated database: added 'mva_suitability' column.")
+            conn.execute("ALTER TABLE dataset_metadata ADD COLUMN quality_report TEXT DEFAULT NULL")
+            logger.info("Migrated database: added 'quality_report' column.")
         except Exception:
-            pass  # Column already exists — safe to ignore
-        # Migration: add score to existing databases that predate it
+            pass
+        # Migration: add quality_score to existing databases
         try:
-            conn.execute("ALTER TABLE dataset_metadata ADD COLUMN score INTEGER DEFAULT NULL")
-            logger.info("Migrated database: added 'score' column.")
+            conn.execute("ALTER TABLE dataset_metadata ADD COLUMN quality_score REAL DEFAULT NULL")
+            logger.info("Migrated database: added 'quality_score' column.")
         except Exception:
-            pass  # Column already exists — safe to ignore
+            pass
+        # Legacy back-compatibility mapping: copy any data from score/mva_suitability to new columns
+        try:
+            conn.execute("UPDATE dataset_metadata SET quality_score = score WHERE quality_score IS NULL AND score IS NOT NULL")
+            conn.execute("UPDATE dataset_metadata SET quality_report = mva_suitability WHERE quality_report IS NULL AND mva_suitability IS NOT NULL")
+            logger.info("Migrated legacy metadata quality metrics.")
+        except Exception:
+            pass
         conn.commit()
         conn.close()
         logger.info(f"Database initialized at {settings.DATABASE_PATH}")
@@ -155,7 +162,14 @@ def insert_metadata(metadata: DatasetMetadata) -> None:
     conn = _get_connection()
     try:
         mva_json = None
-        score_val = None
+        if metadata.quality_report:
+            if hasattr(metadata.quality_report, "model_dump"):
+                mva_json = json.dumps(metadata.quality_report.model_dump())
+            elif isinstance(metadata.quality_report, dict):
+                mva_json = json.dumps(metadata.quality_report)
+            else:
+                mva_json = json.dumps(dict(metadata.quality_report))
+        score_val = metadata.quality_score
         conn.execute(INSERT_METADATA_SQL, (
             metadata.dataset_id,
             metadata.dataset_name,
@@ -189,6 +203,8 @@ def update_metadata_after_classification(
     sub_domain: str,
     dataset_summary: str,
     column_descriptions: dict[str, str],
+    quality_score: Optional[float] = None,
+    quality_report: Optional[Any] = None,
     processing_status: str = "Completed",
 ) -> None:
     """
@@ -197,7 +213,15 @@ def update_metadata_after_classification(
     conn = _get_connection()
     try:
         mva_json = None
-        score_val = None
+        if quality_report:
+            if hasattr(quality_report, "model_dump"):
+                mva_json = json.dumps(quality_report.model_dump())
+            elif isinstance(quality_report, dict):
+                mva_json = json.dumps(quality_report)
+            else:
+                mva_json = json.dumps(dict(quality_report))
+                
+        score_val = quality_score
 
         conn.execute(UPDATE_METADATA_SQL, (
             business_domain,
@@ -220,6 +244,18 @@ def update_metadata_after_classification(
 
 def _row_to_metadata(row: sqlite3.Row) -> DatasetMetadata:
     """Convert a database row to a DatasetMetadata object."""
+    from app.models.schemas import QualityReport
+    
+    mva_raw = row["mva_suitability"] if "mva_suitability" in row.keys() else None
+    quality_report = None
+    if mva_raw:
+        try:
+            quality_report = QualityReport(**json.loads(mva_raw))
+        except Exception as e:
+            logger.warning(f"Failed to deserialize quality_report for dataset {row['dataset_id']}: {e}")
+
+    score_val = row["score"] if "score" in row.keys() else None
+
     return DatasetMetadata(
         dataset_id=row["dataset_id"],
         dataset_name=row["dataset_name"],
@@ -235,6 +271,8 @@ def _row_to_metadata(row: sqlite3.Row) -> DatasetMetadata:
         column_descriptions=json.loads(row["column_descriptions"]),
         sample_data=json.loads(row["sample_data"]),
         processing_status=row["processing_status"],
+        quality_score=score_val,
+        quality_report=quality_report,
     )
 
 
